@@ -30,7 +30,7 @@ use arrow_flight::{
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use common::{server::TestFlightServer, trailers_layer::TrailersLayer};
-use futures::{Future, StreamExt, TryStreamExt};
+use futures::{future, Future, StreamExt, TryStreamExt};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tonic::{
     transport::{Channel, Uri},
@@ -448,8 +448,10 @@ async fn test_do_exchange() {
         test_server
             .set_do_exchange_response(output_flight_data.clone().into_iter().map(Ok).collect());
 
+        let input_stream = futures::stream::iter(input_flight_data.clone()).map(Ok);
+    
         let response_stream = client
-            .do_exchange(futures::stream::iter(input_flight_data.clone()))
+            .do_exchange(input_stream)
             .await
             .expect("error making request");
 
@@ -477,15 +479,14 @@ async fn test_do_exchange() {
 }
 
 #[tokio::test]
-async fn test_do_exchange_error() {
+async fn test_do_exchange_error_server() {
     do_test(|test_server, mut client| async move {
         client.add_header("foo-header", "bar-header-value").unwrap();
 
         let input_flight_data = test_flight_data().await;
+        let input_stream = futures::stream::iter(input_flight_data.clone()).map(Ok);
+        let response = client.do_exchange(input_stream).await;
 
-        let response = client
-            .do_exchange(futures::stream::iter(input_flight_data.clone()))
-            .await;
         let response = match response {
             Ok(_) => panic!("unexpected success"),
             Err(e) => e,
@@ -504,11 +505,12 @@ async fn test_do_exchange_error() {
 }
 
 #[tokio::test]
-async fn test_do_exchange_error_stream() {
+async fn test_do_exchange_error_stream_server() {
     do_test(|test_server, mut client| async move {
         client.add_header("foo-header", "bar-header-value").unwrap();
 
         let input_flight_data = test_flight_data().await;
+        let input_stream = futures::stream::iter(input_flight_data.clone()).map(Ok);
 
         let e = Status::invalid_argument("the error");
         let response = test_flight_data2()
@@ -528,7 +530,7 @@ async fn test_do_exchange_error_stream() {
         test_server.set_do_exchange_response(response);
 
         let response_stream = client
-            .do_exchange(futures::stream::iter(input_flight_data.clone()))
+            .do_exchange(input_stream)
             .await
             .expect("error making request");
 
@@ -548,7 +550,85 @@ async fn test_do_exchange_error_stream() {
     })
     .await;
 }
+#[tokio::test]
+async fn test_do_exchange_error_client() {
+    do_test(|test_server, mut client| async move {
+        client.add_header("foo-header", "bar-header-value").unwrap();
 
+        let e = Status::invalid_argument("bad arg: client");
+
+        // input stream to client sends good FlightData followed by an error
+        let input_flight_data = test_flight_data().await;
+        let input_stream = futures::stream::iter(input_flight_data.clone())
+            .map(Ok)
+            .chain(futures::stream::iter(vec![Err(FlightError::from(
+                e.clone(),
+            ))]));
+
+        // server responds with one good message
+        let response = vec![Ok(PutResult {
+            app_metadata: Bytes::from("foo-metadata"),
+        })];
+        test_server.set_do_exchange_response(response);
+
+        let response_stream = client
+            .do_exchange(input_stream)
+            .await
+            .expect("error making request");
+
+        let response: Result<Vec<_>, _> = response_stream.try_collect().await;
+        let response = match response {
+            Ok(_) => panic!("unexpected success"),
+            Err(e) => e,
+        };
+
+        // expect to the error made from the client
+        expect_status(response, e);
+        // server still got the request messages until the client sent the error
+        assert_eq!(test_server.take_do_exchange_request(), Some(input_flight_data));
+        ensure_metadata(&client, &test_server);
+    })
+    .await;
+}
+#[tokio::test]
+async fn test_do_exchange_error_client_and_server() {
+    do_test(|test_server, mut client| async move {
+        client.add_header("foo-header", "bar-header-value").unwrap();
+
+        let e_client = Status::invalid_argument("bad arg: client");
+        let e_server = Status::invalid_argument("bad arg: server");
+
+        // input stream to client sends good FlightData followed by an error
+        let input_flight_data = test_flight_data().await;
+        let input_stream = futures::stream::iter(input_flight_data.clone())
+            .map(Ok)
+            .chain(futures::stream::iter(vec![Err(FlightError::from(
+                e_client.clone(),
+            ))]));
+
+        // server responds with an error (e.g. because it got truncated data)
+        let response = vec![Err(e_server)];
+        test_server.set_do_exchange_response(response);
+
+        let response_stream = client
+            .do_exchange(input_stream)
+            .await
+            .expect("error making request");
+
+        let response: Result<Vec<_>, _> = response_stream.try_collect().await;
+        let response = match response {
+            Ok(_) => panic!("unexpected success"),
+            Err(e) => e,
+        };
+
+        // expect to the error made from the client (not the server)
+        expect_status(response, e_client);
+        // server still got the request messages until the client sent the error
+        assert_eq!(test_server.take_do_exchange_request(), Some(input_flight_data));
+        ensure_metadata(&client, &test_server);
+    })
+    .await;
+}
 #[tokio::test]
 async fn test_get_schema() {
     do_test(|test_server, mut client| async move {
