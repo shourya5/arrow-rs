@@ -585,11 +585,12 @@ async fn test_do_exchange_error_client() {
         // expect to the error made from the client
         expect_status(response, e);
         // server still got the request messages until the client sent the error
-        assert_eq!(test_server.take_do_exchange_request(), Some(input_flight_data));
+        assert_eq!(test_server.take_do_put_request(), Some(input_flight_data));
         ensure_metadata(&client, &test_server);
     })
     .await;
 }
+
 #[tokio::test]
 async fn test_do_exchange_error_client_and_server() {
     do_test(|test_server, mut client| async move {
